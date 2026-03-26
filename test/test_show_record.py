@@ -226,7 +226,7 @@ class FanucRecordController:
             return
 
         obs_ok = True
-        display_enabled = True
+        display_enabled = False
         try:
             self.camera_manager.start()
             self.logger.info(f"⏳ 等待摄像头初始化...")
