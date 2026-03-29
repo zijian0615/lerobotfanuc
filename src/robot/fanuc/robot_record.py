@@ -160,7 +160,9 @@ class FanucRecordController:
         self.data_store     = MultiEpisodeDataStore(
             data_root=data_root,
             fps=cam_rate_hz,
-            num_cameras=len(cam_ids)
+            num_cameras=len(cam_ids),
+            camera_names=[f"camera_{i}" for i in range(len(cam_ids))],
+            chunk_size=1000
         )
         self.pending_seq_ids: set = set()
         self._interrupt_count = 0
