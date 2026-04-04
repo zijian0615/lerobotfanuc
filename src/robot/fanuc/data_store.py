@@ -86,82 +86,7 @@ class MP4VideoEncoder:
         self._thread.start()
         logger.info(f"✅ MP4 Encoder started (FFmpeg + H.264): {self.output_path}")
 
-    def _encode_loop(self) -> None:
-        """后台编码线程 - 使用 ffmpeg 管道"""
-        try:
-            # FFmpeg 命令行参数（标准 H.264 编码参数）
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-y',  # 覆盖输出文件
-                '-f', 'rawvideo',  # 输入格式：原始视频
-                '-pix_fmt', 'bgr24',  # OpenCV 使用 BGR 格式
-                '-s', f'{self.width}x{self.height}',  # 分辨率
-                '-r', str(self.fps),  # 帧率
-                '-i', 'pipe:0',  # 从 stdin 读取
-                # 视频编码参数
-                '-c:v', self.codec,  # 视频编码器（libx264）
-                '-profile:v', 'high',  # H.264 配置文件
-                '-level', '4.0',  # H.264 等级
-                '-crf', '23',  # 质量（0-51，越小越好）
-                '-pix_fmt', 'yuv420p',  # 输出像素格式
-                # 音频参数
-                '-c:a', 'aac',  # 音频编码器
-                '-b:a', '128k',  # 音频比特率
-                # 优化参数
-                '-movflags', '+faststart',  # 优化 MP4 元数据位置方便流式播放
-                '-preset', 'medium',  # 编码速度 (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)
-                self.output_path
-            ]
-            
-            self._process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            
-            frame_idx = 0
-            while self._running:
-                try:
-                    frame = self.frame_queue.get(timeout=1.0)
-                    if frame is None:  # 哨兵值：停止编码
-                        break
-                    
-                    # 确保帧大小正确
-                    if frame.shape[:2] != (self.height, self.width):
-                        frame = cv2.resize(frame, (self.width, self.height))
-                    
-                    # 确保格式正确（BGR）
-                    if len(frame.shape) != 3 or frame.shape[2] != 3:
-                        logger.warning(f"⚠️  Frame shape mismatch: {frame.shape}, expected ({self.height}, {self.width}, 3)")
-                        continue
-                    
-                    # 写入原始帧数据到 ffmpeg stdin
-                    self._process.stdin.write(frame.tobytes())
-                    
-                    with self._lock:
-                        self._frame_count += 1
-                    frame_idx += 1
-                    
-                except queue.Empty:
-                    if not self._running:
-                        break
-                except Exception as e:
-                    logger.error(f"❌ Error writing frame to ffmpeg: {e}")
-                    break
-            
-            # 关闭 ffmpeg 进程
-            if self._process and self._process.stdin:
-                self._process.stdin.close()
-            if self._process:
-                self._process.wait(timeout=10)
-            
-            logger.info(f"✅ MP4 encoded {frame_idx} frames: {self.output_path}")
-            
-        except FileNotFoundError:
-            logger.error("❌ ffmpeg not found. Please install ffmpeg: brew install ffmpeg")
-        except Exception as e:
-            logger.error(f"❌ FFmpeg encoding error: {e}")
+
     
     def get_frame_count(self) -> int:
         """获取当前编码的帧数"""
@@ -182,14 +107,110 @@ class MP4VideoEncoder:
     def stop(self) -> None:
         """停止编码器"""
         self._running = False
-        try:
-            self.frame_queue.put(None, timeout=1.0)  # 哨兵
-        except queue.Full:
-            pass
+        
+        # 清空队列，强制插入哨兵
+        while True:
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.frame_queue.put(None)  # 哨兵必达
+        
         if self._thread:
-            self._thread.join(timeout=10)
+            self._thread.join(timeout=30)  # 给 ffmpeg 足够时间写 moov
         logger.info("✅ Frame encoding completed")
 
+    def _encode_loop(self) -> None:
+        """后台编码线程 - 使用 ffmpeg 管道"""
+        try:
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-y',
+                '-f', 'rawvideo',
+                '-pix_fmt', 'bgr24',
+                '-s', f'{self.width}x{self.height}',
+                '-r', str(self.fps),
+                '-i', 'pipe:0',
+                '-c:v', self.codec,
+                '-profile:v', 'high',
+                '-level', '4.0',
+                '-crf', '23',
+                '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart',
+                '-preset', 'medium',
+                '-an',  # 没有音频输入，禁用音频，避免 ffmpeg 等待音频流
+                self.output_path
+            ]
+
+            self._process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,  # ← 改为 PIPE，捕获错误日志
+            )
+
+            frame_idx = 0
+            try:
+                while self._running:
+                    try:
+                        frame = self.frame_queue.get(timeout=1.0)
+                        if frame is None:  # 哨兵值：停止编码
+                            break
+
+                        if frame.shape[:2] != (self.height, self.width):
+                            frame = cv2.resize(frame, (self.width, self.height))
+
+                        if len(frame.shape) != 3 or frame.shape[2] != 3:
+                            logger.warning(f"⚠️  Frame shape mismatch: {frame.shape}")
+                            continue
+
+                        self._process.stdin.write(frame.tobytes())
+
+                        with self._lock:
+                            self._frame_count += 1
+                        frame_idx += 1
+
+                    except queue.Empty:
+                        if not self._running:
+                            break
+                    except BrokenPipeError:
+                        # ffmpeg 进程已退出，提前终止
+                        stderr_out = self._process.stderr.read().decode(errors="replace")
+                        logger.error(f"❌ ffmpeg pipe broken:\n{stderr_out}")
+                        break
+                    except Exception as e:
+                        logger.error(f"❌ Error writing frame to ffmpeg: {e}")
+                        break
+
+            finally:
+                # ✅ 核心修复：无论正常/异常退出，都必须关闭 stdin
+                # ffmpeg 收到 EOF 才会写 moov atom，缺少这步就会产生损坏文件
+                try:
+                    if self._process.stdin:
+                        self._process.stdin.close()
+                except Exception:
+                    pass
+
+                try:
+                    self._process.wait(timeout=30)  # ← 给足时间写 moov（原来 10s 可能不够）
+                except subprocess.TimeoutExpired:
+                    logger.error("❌ ffmpeg wait timeout, killing process (moov may be lost!)")
+                    self._process.kill()
+
+                # 打印 ffmpeg 的错误输出（方便排查）
+                try:
+                    stderr_out = self._process.stderr.read().decode(errors="replace")
+                    if stderr_out:
+                        logger.debug(f"ffmpeg stderr:\n{stderr_out}")
+                except Exception:
+                    pass
+
+            logger.info(f"✅ MP4 encoded {frame_idx} frames: {self.output_path}")
+
+        except FileNotFoundError:
+            logger.error("❌ ffmpeg not found. Please install ffmpeg: brew install ffmpeg")
+        except Exception as e:
+            logger.error(f"❌ FFmpeg encoding error: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 2. Parquet Data Writer (Chunk-based)
